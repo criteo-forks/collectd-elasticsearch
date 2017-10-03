@@ -660,6 +660,11 @@ def configure_callback(conf):
                 c.defaults.add(metric_name)
         elif node.key == "IndexStatsMasterOnly":
             c.master_only = str_to_bool(node.values[0])
+        elif node.key == 'CustomFields':
+            for field in node.values:
+                c.es_custom_fields.append(field)
+        elif node.key == 'EnableCustomFieldStats':
+            c.enable_custom_field_stats = str_to_bool(node.values[0])
         elif node.key == "Dimensions":
             c.extra_dimensions = node.values[0]
         else:
@@ -677,6 +682,7 @@ def configure_callback(conf):
     log.info('configured_thread_pools: %s' % c.configured_thread_pools)
     log.info('metrics to collect: %s' % c.defaults)
     log.info('master_only: %s' % c.master_only)
+    log.info('enable_custom_field_stats: %s' % c.enable_custom_field_stats)
 
     # determine node information
     c.load_es_info()
@@ -732,8 +738,10 @@ class Cluster(object):
         self.es_cluster = None
         self.es_version = None
         self.es_index = []
+        self.es_custom_fields = []
         self.enable_index_stats = True
         self.enable_cluster_stats = True
+        self.enable_custom_field_stats = False
         self.index_interval = 300
         self.detailed_metrics = True
         self.configured_thread_pools = set()
@@ -753,6 +761,7 @@ class Cluster(object):
         self.es_node_url = ""
         self.es_cluster_url = ""
         self.es_index_url = ""
+        self.es_search_url = ""
 
         self.thread_pools = []
 
@@ -843,6 +852,9 @@ class Cluster(object):
                                 ":" + str(self.es_port) + "/" + \
                                 ",".join(self.es_index) + "/_stats"
 
+        self.es_search_url = self.es_url_scheme + "://" + self.es_host + \
+                       ":" + str(self.es_port) + "/_all/_search?size=0"
+
         # common thread pools for all ES versions
         thread_pools = ['generic', 'index', 'get', 'snapshot', 'bulk',
                         'warmer', 'flush', 'search', 'refresh']
@@ -920,6 +932,22 @@ class Cluster(object):
             log.info('Parsing cluster stats')
             self.parse_cluster_stats(cluster_json_stats, CLUSTER_STATS)
 
+        if self.enable_custom_field_stats and self.es_master_eligible:
+            for field in self.es_custom_fields:
+                data = json.dumps({
+                    'aggs': {
+                        'fields_count': {
+                            'terms': {
+                                'field' : field,
+                                'size': 1000
+                                }
+                            }
+                        }
+                    })
+                custom_field_json_stats = self.fetch_url(self.es_search_url, data)
+                log.info('Parsing custom field="%s" stats' % field)
+                self.parse_custom_field_stats(custom_field_json_stats, field)
+
         if (self.enable_index_stats and self.es_master_eligible and
             self.skip_count >= self.index_skip) \
             and ((self.master_only and self.es_current_master)
@@ -941,11 +969,11 @@ class Cluster(object):
         # Increment skip count
         self.skip_count += 1
 
-    def fetch_url(self, url):
+    def fetch_url(self, url, data=None):
         response = None
         try:
             log.info('Fetching api information from: %s' % url)
-            request = urllib2.Request(url)
+            request = urllib2.Request(url, data)
             if self.es_username:
                 authheader = base64.encodestring('%s:%s' %
                                                  (self.es_username,
@@ -1083,6 +1111,20 @@ class Cluster(object):
                 name = name.format(
                     index_name=sanitize_type_instance(index_name))
                 self.dispatch_stat(result, name, key)
+
+    def parse_custom_field_stats(self, json, field):
+        """Parse custom field stats response from ElasticSearch"""
+        tot_doc_count = int(json['hits']['total'])
+        for obj in json['aggregations']['fields_count']['buckets']:
+            name = '%s_%s_doc_count' % (field, obj["key"])
+            doc_count = int(obj["doc_count"])
+            key = Stat('gauge', name)
+            if self.detailed_metrics is True and (100 * doc_count / tot_doc_count) > 0 :
+                self.dispatch_stat(doc_count, name, key)
+
+        name = '%s_%s_doc_count' % (field, "_all")
+        key = Stat('gauge', name)
+        self.dispatch_stat(tot_doc_count, name, key)
 
     def dispatch_stat(self, result, name, key, dimensions=None):
         """Read a key from info response data and dispatch a value"""
@@ -1299,6 +1341,7 @@ if __name__ == '__main__':
     # allow user to override ES host name for easier testing
     if len(sys.argv) > 1:
         c.es_host = sys.argv[1]
+        c.es_port = sys.argv[2]
     handle.verbose = True
     configure_test(c)
     collectd = CollectdMock()
