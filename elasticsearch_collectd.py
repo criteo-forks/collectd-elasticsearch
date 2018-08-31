@@ -973,7 +973,8 @@ class Cluster(object):
         response = None
         try:
             log.info('Fetching api information from: %s' % url)
-            request = urllib2.Request(url, data)
+            headers = {'Content-Type': 'application/json'}
+            request = urllib2.Request(url, data, headers)
             if self.es_username:
                 authheader = base64.encodestring('%s:%s' %
                                                  (self.es_username,
